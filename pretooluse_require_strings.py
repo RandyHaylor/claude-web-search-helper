@@ -169,9 +169,20 @@ def parse_events(path: Path) -> Iterator[dict]:
 
 
 def find_last_assistant_text(events: list[dict]) -> str:
-    """Walk events from the end backward to find the most recent assistant
-    message, then concatenate all its text-type content blocks.
-    Returns empty string if no assistant message found."""
+    """Walk events from the end backward and return the concatenated text from
+    the most recent assistant event that actually contains one or more
+    `text`-type content blocks.
+
+    Claude Code splits an assistant turn into multiple JSONL events (one per
+    streamed content block), e.g. a thinking block on one line, a text block
+    on the next, a tool_use block on the next. The naive "stop at the first
+    assistant event from the end" approach picks the tool_use sub-chunk and
+    sees no text. This implementation instead skips assistant events whose
+    content has no text blocks and keeps walking until it finds one that does,
+    so a text block written earlier in the SAME assistant turn (or in an
+    earlier completed turn) is correctly returned.
+
+    Returns empty string if no assistant event with a text block is found."""
     for event in reversed(events):
         if event.get("type") != "assistant":
             continue
@@ -184,7 +195,12 @@ def find_last_assistant_text(events: list[dict]) -> str:
             for block in content
             if isinstance(block, dict) and block.get("type") == "text"
         ]
-        return "\n".join(t for t in text_parts if t)
+        text_parts = [t for t in text_parts if t]
+        if not text_parts:
+            # This assistant event has no text content (e.g. thinking-only or
+            # tool_use-only sub-chunk). Keep walking backward.
+            continue
+        return "\n".join(text_parts)
     return ""
 
 
@@ -234,6 +250,59 @@ def emit_deny(missing: list[str]) -> None:
     sys.stdout.flush()
 
 
+def write_debug_dump(
+    transcript_path: Path,
+    events: list,
+    last_assistant_text: str,
+    missing: list,
+) -> None:
+    """Append one JSON record per invocation to /tmp/pretooluse_hook_debug.log
+    describing what the script actually read. Best-effort; never raises."""
+    import datetime
+    debug_log_path = Path("/tmp/pretooluse_hook_debug.log")
+    try:
+        picked_index = None
+        picked_content_block_types = []
+        for idx in range(len(events) - 1, -1, -1):
+            ev = events[idx]
+            if ev.get("type") == "assistant":
+                picked_index = idx
+                content = ev.get("message", {}).get("content", [])
+                if isinstance(content, list):
+                    picked_content_block_types = [
+                        (block.get("type") if isinstance(block, dict) else "non-dict")
+                        for block in content
+                    ]
+                break
+        tail_event_summary = [
+            {"i": len(events) - 1 - offset,
+             "type": events[len(events) - 1 - offset].get("type")}
+            for offset in range(min(5, len(events)))
+        ]
+        record = {
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "transcript_path": str(transcript_path),
+            "total_events": len(events),
+            "tail_5_event_types": tail_event_summary,
+            "picked_assistant_event_index": picked_index,
+            "picked_assistant_content_block_types": picked_content_block_types,
+            "extracted_text_length": len(last_assistant_text),
+            "extracted_text_first_800": last_assistant_text[:800],
+            "extracted_text_last_400": last_assistant_text[-400:] if last_assistant_text else "",
+            "normalized_text_first_800": normalize(last_assistant_text)[:800],
+            "missing_required_phrases_count": len(missing),
+            "missing_required_phrases": missing,
+        }
+        with debug_log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as exc:
+        try:
+            with debug_log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"debug_write_error": str(exc)}) + "\n")
+        except Exception:
+            pass
+
+
 def main() -> int:
     args = parse_args()
     required = args.require  # list of strings
@@ -253,6 +322,8 @@ def main() -> int:
     last_assistant_text = find_last_assistant_text(events)
 
     missing = find_missing(last_assistant_text, required)
+
+    write_debug_dump(transcript_path, events, last_assistant_text, missing)
 
     if not missing:
         # All required strings present — allow by exiting 0 with no output.

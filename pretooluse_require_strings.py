@@ -323,7 +323,9 @@ def main() -> int:
 
     missing = find_missing(last_assistant_text, required)
 
-    write_debug_dump(transcript_path, events, last_assistant_text, missing)
+    # Uncomment the next line to write per-invocation diagnostics to
+    # /tmp/pretooluse_hook_debug.log (see write_debug_dump above).
+    # write_debug_dump(transcript_path, events, last_assistant_text, missing)
 
     if not missing:
         # All required strings present — allow by exiting 0 with no output.
